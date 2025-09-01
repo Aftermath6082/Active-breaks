@@ -1,0 +1,606 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+from __future__ import annotations
+import sys, json, platform, logging
+from pathlib import Path
+from urllib.parse import urljoin
+
+from PySide6.QtCore import Qt, QTimer, QUrl, QSize
+from PySide6.QtGui import QAction, QIcon, QPixmap, QPainter, QColor, QFont, QKeySequence, QShortcut
+from PySide6.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QPushButton, QLabel, QSystemTrayIcon,
+    QMenu, QDialog, QLineEdit, QSpinBox, QCheckBox, QHBoxLayout, QMessageBox
+)
+from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+from PySide6.QtMultimediaWidgets import QVideoWidget
+
+# ---------- Logging ----------
+CACHE_DIR = Path.home() / ".active_breaks_cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+LOG_PATH = CACHE_DIR / "ui.log"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[logging.FileHandler(LOG_PATH, encoding="utf-8")]
+)
+log = logging.getLogger("ab.ui")
+
+# ---------- Optional macOS kiosk via AppKit ----------
+HAS_APPKIT = False
+KIOSK_OPTS = 0
+try:
+    if platform.system() == "Darwin":
+        from AppKit import NSApplication, NSApplicationPresentationOptions
+        HAS_APPKIT = True
+        KIOSK_OPTS = (
+            NSApplicationPresentationOptions.NSApplicationPresentationHideDock |
+            NSApplicationPresentationOptions.NSApplicationPresentationHideMenuBar |
+            NSApplicationPresentationOptions.NSApplicationPresentationDisableAppleMenu |
+            NSApplicationPresentationOptions.NSApplicationPresentationDisableProcessSwitching |  # Cmd+Tab
+            NSApplicationPresentationOptions.NSApplicationPresentationDisableForceQuit |        # Cmd+Opt+Esc
+            NSApplicationPresentationOptions.NSApplicationPresentationDisableSessionTermination |
+            NSApplicationPresentationOptions.NSApplicationPresentationDisableHideApplication |
+            NSApplicationPresentationOptions.NSApplicationPresentationAutoHideToolbar
+        )
+        log.info("AppKit import OK; kiosk flags prepared.")
+    else:
+        log.info("Non-macOS platform; AppKit not used.")
+except Exception as e:
+    HAS_APPKIT = False
+    log.warning("AppKit not available: %r", e)
+
+APP_NAME = "Active Breaks"
+BRAND_TEXT = "Fitnessterapeuten v. FysioKolding"
+
+# ---------- Content ----------
+CONTENT_BASE = "http://rjwebsite.dk/wp-content/uploads/active-breaks/videos/testvideos/"
+FREE_VIDEOS = [
+    ("Test video 1", "Test_video_1.mp4", 0, "Test"),
+]
+
+# ---------- Settings ----------
+SETTINGS_PATH = CACHE_DIR / "settings.json"
+DEFAULTS = {
+    "interval_min": 15,
+    "break_seconds": 90,     # TOTAL hard cap (video + post)
+    "post_seconds": 5,       # extra seconds after last video
+    "videos_per_break": 1,   # how many videos per break
+    "unlock_code": "",       # empty => any non-empty typed code unlocks
+    "muted": False,
+}
+
+def load_settings() -> dict:
+    if SETTINGS_PATH.exists():
+        try:
+            return {**DEFAULTS, **json.loads(SETTINGS_PATH.read_text("utf-8"))}
+        except Exception as e:
+            log.warning("Failed to read settings: %r", e)
+    return DEFAULTS.copy()
+
+def save_settings(cfg: dict) -> None:
+    try:
+        SETTINGS_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    except Exception as e:
+        log.warning("Failed to save settings: %r", e)
+
+# ---------- macOS Kiosk Manager ----------
+class MacKioskManager:
+    def __init__(self):
+        self.enabled = False
+        self._watchdog = None
+
+    def _apply(self):
+        try:
+            app = NSApplication.sharedApplication()
+            app.setPresentationOptions_(KIOSK_OPTS)
+            if not self.enabled:
+                log.info("Kiosk ON (AppKit).")
+            self.enabled = True
+        except Exception as e:
+            if self.enabled:
+                log.warning("Kiosk apply failed: %r", e)
+            self.enabled = False
+
+    def enter(self):
+        if not HAS_APPKIT:
+            log.info("Kiosk skipped: AppKit not present.")
+            return
+        self._apply()
+        # watchdog: re-assert kiosk every 1.5s (some macOS builds reset it)
+        if self._watchdog is None:
+            self._watchdog = QTimer()
+            self._watchdog.setInterval(1500)
+            self._watchdog.timeout.connect(self._apply)
+            self._watchdog.start()
+
+    def exit(self):
+        if not HAS_APPKIT:
+            return
+        try:
+            app = NSApplication.sharedApplication()
+            app.setPresentationOptions_(0)
+            log.info("Kiosk OFF (AppKit).")
+        except Exception as e:
+            log.warning("Kiosk exit failed: %r", e)
+        self.enabled = False
+        if self._watchdog:
+            self._watchdog.stop()
+            self._watchdog = None
+
+KIOSK = MacKioskManager()
+
+# ---------- Fullscreen Break Window ----------
+class FullscreenBreak(QWidget):
+    def __init__(self, title: str, post_seconds: int, playlist: list[tuple[str, str]],
+                 on_finish_cb, unlock_code: str, start_volume: float = 1.0, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self._on_finish_cb = on_finish_cb
+        self.unlock_code = (unlock_code or "").strip()
+        self.post_seconds = int(max(0, post_seconds))
+        self._post_phase = False
+        self._hard_cap_remaining = 0
+
+        # --- UI
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 12, 12)
+        lay.setSpacing(8)
+
+        self.video = QVideoWidget(self)
+        self.video.setMinimumSize(QSize(640, 360))
+        lay.addWidget(self.video, stretch=1)
+
+        controls = QHBoxLayout()
+        self.unlock_btn = QPushButton("🔒 Lås op med kode", self)
+        self.unlock_btn.clicked.connect(self._ask_unlock)
+        controls.addWidget(self.unlock_btn, stretch=0)
+
+        self.info_lbl = QLabel(f"{APP_NAME} — {BRAND_TEXT}", self)
+        self.info_lbl.setAlignment(Qt.AlignCenter)
+        controls.addWidget(self.info_lbl, stretch=1)
+        lay.addLayout(controls)
+
+        # inline unlock overlay
+        self._unlock_overlay = None
+        self._build_unlock_overlay()
+
+        # --- Player + audio
+        self.audio = QAudioOutput(self)
+        self.audio.setVolume(float(max(0.0, min(1.0, start_volume))))
+        self.player = QMediaPlayer(self)
+        self.player.setVideoOutput(self.video)
+        self.player.setAudioOutput(self.audio)
+
+        # robust end-of-media detection
+        self.player.mediaStatusChanged.connect(self._on_media_status)
+        try:
+            self.player.playbackStateChanged.connect(self._on_playback_state)
+        except Exception:
+            pass
+        self.player.positionChanged.connect(self._on_position_changed)
+
+        # playlist
+        self._playlist = playlist[:]  # (title, url)
+        self._idx = -1
+        self._pos_advanced = False
+        self._advance_to_next_video(start=True)
+
+        # kiosk flags (Qt)
+        self.setWindowFlags(
+            Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.BypassWindowManagerHint
+        )
+        self.setWindowModality(Qt.ApplicationModal)
+
+        # timers
+        self.timer = QTimer(self)
+        self.timer.setInterval(1000)
+        self.timer.timeout.connect(self._tick)
+        self.remaining = self.post_seconds
+        self.timer.start()
+
+        # fallback “bring to front” only used when AppKit isn’t active
+        self._focus_timer = QTimer(self)
+        self._focus_timer.setInterval(1200)
+        self._focus_timer.timeout.connect(self._keep_foreground)
+        self._focus_timer.start()
+
+        # Shortcut: Cmd+Alt+L opens unlock overlay
+        QShortcut(QKeySequence("Meta+Alt+L"), self, activated=self._ask_unlock)
+
+    # ----- Events
+    def showEvent(self, e):
+        super().showEvent(e)
+        try:
+            self.showFullScreen()
+            self.raise_()
+            self.activateWindow()
+            if HAS_APPKIT:
+                KIOSK.enter()
+            else:
+                # fallback only; cannot block Cmd+Tab without AppKit
+                self.grabKeyboard()
+                self.grabMouse()
+                log.info("Fallback focus/grabs active (no AppKit).")
+        except Exception as ex:
+            log.warning("showEvent setup failed: %r", ex)
+
+    def closeEvent(self, e):
+        try:
+            if HAS_APPKIT and KIOSK.enabled:
+                KIOSK.exit()
+        except Exception as ex:
+            log.warning("closeEvent kiosk exit failed: %r", ex)
+        try:
+            self.releaseKeyboard()
+            self.releaseMouse()
+        except Exception:
+            pass
+        super().closeEvent(e)
+
+    def resizeEvent(self, event):
+        try:
+            if self._unlock_overlay and self._unlock_overlay.isVisible():
+                self._unlock_overlay.setGeometry(self.rect())
+        except Exception:
+            pass
+        super().resizeEvent(event)
+
+    def _keep_foreground(self):
+        if not HAS_APPKIT:
+            try:
+                self.raise_()
+                self.activateWindow()
+            except Exception:
+                pass
+
+    # ----- Playlist / video
+    def _advance_to_next_video(self, start=False):
+        self._idx += 0 if start else 1
+        self._pos_advanced = False
+        if self._idx >= len(self._playlist):
+            if self.post_seconds > 0:
+                self._post_phase = True
+                self.remaining = self.post_seconds
+                self.info_lbl.setText(f"Pusteøvelse… {self.remaining}s")
+            else:
+                self._finish(True)
+            return
+        title, url = self._playlist[self._idx]
+        self.info_lbl.setText(f"Afspiller: {title}")
+        self.player.setSource(QUrl(url))
+        try:
+            self.player.play()
+        except Exception:
+            self._advance_after_video()
+
+    def _advance_after_video(self):
+        try:
+            self.player.stop()
+        except Exception:
+            pass
+        self._advance_to_next_video(start=False)
+
+    # ----- End-of-media detection
+    def _on_media_status(self, status):
+        try:
+            s = str(status)
+            if "EndOfMedia" in s:
+                self._advance_after_video(); return
+            if int(status) in (7, 8):
+                self._advance_after_video(); return
+        except Exception:
+            pass
+
+    def _on_playback_state(self, state):
+        try:
+            if int(state) == int(QMediaPlayer.PlaybackState.StoppedState) and not self._post_phase:
+                self._advance_after_video()
+        except Exception:
+            pass
+
+    def _on_position_changed(self, pos):
+        try:
+            dur = self.player.duration()
+            if dur > 0 and pos >= max(0, dur - 200) and not self._pos_advanced and not self._post_phase:
+                self._pos_advanced = True
+                self._advance_after_video()
+        except Exception:
+            pass
+
+    # ----- Timer / hard-cap
+    def _tick(self):
+        if getattr(self, "_hard_cap_remaining", 0) > 0:
+            self._hard_cap_remaining -= 1
+            if self._hard_cap_remaining <= 0:
+                try:
+                    self.player.stop()
+                except Exception:
+                    pass
+                self._finish(True)
+                return
+        if self._post_phase:
+            self.remaining -= 1
+            if self.remaining <= 0:
+                self._finish(True)
+            else:
+                self.info_lbl.setText(f"Pusteøvelse… {self.remaining}s")
+
+    # ----- Unlock overlay
+    def _ask_unlock(self):
+        try:
+            self._show_unlock_overlay()
+        except Exception:
+            pass
+
+    def _build_unlock_overlay(self):
+        if self._unlock_overlay is not None:
+            return
+        ov = QWidget(self)
+        ov.setObjectName("unlockOverlay")
+        ov.setAttribute(Qt.WA_StyledBackground, True)
+        ov.setStyleSheet("#unlockOverlay { background: rgba(0,0,0,180); }")
+        ov.hide()
+
+        panel = QWidget(ov)
+        panel.setObjectName("unlockPanel")
+        panel.setAttribute(Qt.WA_StyledBackground, True)
+        panel.setStyleSheet(
+            """
+            #unlockPanel { background: white; border-radius: 12px; }
+            QLabel#unlockTitle { font-size: 20px; font-weight: 600; }
+            QLineEdit { padding: 6px 8px; font-size: 16px; }
+            QPushButton { padding: 6px 10px; font-size: 14px; }
+            """
+        )
+
+        v = QVBoxLayout(panel)
+        v.setContentsMargins(20, 20, 20, 16)
+        v.setSpacing(10)
+
+        title = QLabel(
+            "Indtast låsekode for at afslutte pausen:" if self.unlock_code else
+            "Indtast en kode (ingen kode sat).", panel
+        )
+        title.setObjectName("unlockTitle")
+        v.addWidget(title)
+
+        self._unlock_edit = QLineEdit(panel)
+        self._unlock_edit.setEchoMode(QLineEdit.Password)
+        v.addWidget(self._unlock_edit)
+
+        self._unlock_error = QLabel("", panel)
+        self._unlock_error.setStyleSheet("color: #C62828;")
+        v.addWidget(self._unlock_error)
+
+        btn_row = QHBoxLayout()
+        cancel = QPushButton("Annuller", panel)
+        ok = QPushButton("Lås op", panel)
+        cancel.clicked.connect(self._hide_unlock_overlay)
+        ok.clicked.connect(self._submit_unlock)
+        btn_row.addWidget(cancel)
+        btn_row.addStretch(1)
+        btn_row.addWidget(ok)
+        v.addLayout(btn_row)
+
+        def _relayout():
+            ov.setGeometry(self.rect())
+            w = max(360, int(self.width() * 0.28))
+            h = 180
+            panel.resize(w, h)
+            panel.move((ov.width() - w)//2, (ov.height() - h)//2)
+
+        ov.resizeEvent = lambda event: (_relayout(), QWidget.resizeEvent(ov, event))
+        _relayout()
+
+        self._unlock_overlay = ov
+        self._unlock_panel = panel
+
+    def _show_unlock_overlay(self):
+        if not self._unlock_overlay:
+            self._build_unlock_overlay()
+        self._unlock_error.setText("")
+        self._unlock_edit.clear()
+        self._unlock_overlay.show()
+        self._unlock_overlay.raise_()
+        self._unlock_panel.raise_()
+        self._unlock_edit.setFocus()
+
+    def _hide_unlock_overlay(self):
+        if self._unlock_overlay:
+            self._unlock_overlay.hide()
+
+    def _submit_unlock(self):
+        typed = (self._unlock_edit.text() or "").strip()
+        if self.unlock_code:
+            if typed == self.unlock_code:
+                self._hide_unlock_overlay()
+                self._finish(True)
+            else:
+                self._unlock_error.setText("Forkert kode. Prøv igen.")
+                self._unlock_edit.selectAll()
+                self._unlock_edit.setFocus()
+        else:
+            if typed:
+                self._hide_unlock_overlay()
+                self._finish(True)
+            else:
+                self._unlock_error.setText("Skriv en kode (eller tryk Annuller).")
+                self._unlock_edit.setFocus()
+
+    # ----- Finish / cleanup
+    def _finish(self, forced=False):
+        try:
+            self.timer.stop()
+        except Exception:
+            pass
+        if hasattr(self, "_focus_timer"):
+            try:
+                self._focus_timer.stop()
+            except Exception:
+                pass
+        try:
+            self.releaseKeyboard()
+            self.releaseMouse()
+        except Exception:
+            pass
+        if HAS_APPKIT and KIOSK.enabled:
+            KIOSK.exit()
+        self.close()
+        if callable(self._on_finish_cb):
+            try:
+                self._on_finish_cb()
+            except Exception:
+                pass
+
+# ---------- Settings Dialog ----------
+class SettingsDialog(QDialog):
+    def __init__(self, cfg: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Indstillinger")
+        self.setModal(True)
+        lay = QVBoxLayout(self)
+
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("Pausens varighed (sek):"))
+        self.break_secs = QSpinBox()
+        self.break_secs.setRange(10, 3600)
+        self.break_secs.setValue(int(cfg["break_seconds"]))
+        row1.addWidget(self.break_secs)
+        lay.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("Antal videoer pr. pause:"))
+        self.videos_per = QSpinBox()
+        self.videos_per.setRange(1, 10)
+        self.videos_per.setValue(int(cfg["videos_per_break"]))
+        row2.addWidget(self.videos_per)
+        lay.addLayout(row2)
+
+        row3 = QHBoxLayout()
+        row3.addWidget(QLabel("Ekstra pause efter video (sek):"))
+        self.post_secs = QSpinBox()
+        self.post_secs.setRange(0, 600)
+        self.post_secs.setValue(int(cfg["post_seconds"]))
+        row3.addWidget(self.post_secs)
+        lay.addLayout(row3)
+
+        row4 = QHBoxLayout()
+        row4.addWidget(QLabel("Låsekode (tom = bruger kan vælge kode):"))
+        self.code_edit = QLineEdit(cfg.get("unlock_code", ""))
+        self.code_edit.setEchoMode(QLineEdit.Password)
+        row4.addWidget(self.code_edit)
+        lay.addLayout(row4)
+
+        self.mute_chk = QCheckBox("Start uden lyd")
+        self.mute_chk.setChecked(bool(cfg.get("muted", False)))
+        lay.addWidget(self.mute_chk)
+
+        btns = QHBoxLayout()
+        save_btn = QPushButton("Gem")
+        cancel_btn = QPushButton("Annuller")
+        save_btn.clicked.connect(self.accept)
+        cancel_btn.clicked.connect(self.reject)
+        btns.addWidget(save_btn); btns.addWidget(cancel_btn)
+        lay.addLayout(btns)
+
+    def values(self) -> dict:
+        return {
+            "break_seconds": int(self.break_secs.value()),
+            "videos_per_break": int(self.videos_per.value()),
+            "post_seconds": int(self.post_secs.value()),
+            "unlock_code": self.code_edit.text(),
+            "muted": bool(self.mute_chk.isChecked()),
+        }
+
+# ---------- Tray App ----------
+class ActiveBreaksApp(QApplication):
+    def __init__(self, argv):
+        super().__init__(argv)
+        self.setApplicationName(APP_NAME)
+        self.cfg = load_settings()
+        log.info("Startup. HAS_APPKIT=%s", HAS_APPKIT)
+
+        # tray
+        self.tray = QSystemTrayIcon(self._make_tray_icon())
+        self.tray.setToolTip(APP_NAME)
+        self.tray.setIcon(self._make_tray_icon())
+        menu = QMenu()
+
+        show_now = QAction("Vis pause nu", self)
+        show_now.triggered.connect(lambda: self._trigger_break())
+        menu.addAction(show_now)
+
+        settings_act = QAction("Indstillinger…", self)
+        settings_act.triggered.connect(self._open_settings)
+        menu.addAction(settings_act)
+
+        quit_act = QAction("Afslut", self)
+        quit_act.triggered.connect(self.quit)
+        menu.addAction(quit_act)
+
+        self.tray.setContextMenu(menu)
+        self.tray.show()
+
+        self._break_windows: list[FullscreenBreak] = []
+
+    def _make_tray_icon(self) -> QIcon:
+        size = 128
+        pm = QPixmap(size, size)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setBrush(QColor("#2C7BE5")); p.setPen(Qt.NoPen)
+        p.drawEllipse(0, 0, size, size)
+        p.setPen(QColor("white"))
+        f = QFont(); f.setBold(True); f.setPointSize(64)
+        p.setFont(f)
+        p.drawText(pm.rect(), Qt.AlignCenter, "AB")
+        p.end()
+        return QIcon(pm)
+
+    def _open_settings(self):
+        dlg = SettingsDialog(self.cfg)
+        if dlg.exec() == QDialog.Accepted:
+            self.cfg.update(dlg.values())
+            save_settings(self.cfg)
+
+    def _trigger_break(self):
+        n = max(1, int(self.cfg.get("videos_per_break", 1)))
+        vids = []
+        for i, (title, fname, _, _) in enumerate(FREE_VIDEOS):
+            if i >= n: break
+            url = urljoin(CONTENT_BASE, fname)
+            vids.append((title, url))
+        if not vids:
+            QMessageBox.warning(None, APP_NAME, "Ingen videoer tilgængelige.")
+            return
+
+        post_sec = int(max(0, self.cfg.get("post_seconds", 0)))
+        display_title = f"{APP_NAME} — {BRAND_TEXT}"
+
+        for screen in self.screens():
+            w = FullscreenBreak(
+                display_title, post_sec, vids, self._break_done,
+                self.cfg.get("unlock_code", ""),
+                start_volume=(0.0 if self.cfg.get("muted", False) else 1.0),
+            )
+            try:
+                w._hard_cap_remaining = int(self.cfg.get("break_seconds", 0))
+            except Exception:
+                w._hard_cap_remaining = 0
+
+            w.setGeometry(screen.geometry())
+            w.showFullScreen()
+            w.raise_(); w.activateWindow()
+            self._break_windows.append(w)
+
+    def _break_done(self):
+        self._break_windows = [w for w in self._break_windows if w.isVisible()]
+
+def main():
+    app = ActiveBreaksApp(sys.argv)
+    sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()
